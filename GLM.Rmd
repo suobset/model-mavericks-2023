@@ -1,0 +1,578 @@
+---
+title: "GLM"
+author: "Quinn White"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    df_print: paged
+    code_folding: hide
+bibliography: "`r rbbt::bbt_write_bib('bibliography_multilevel_report.json', overwrite = TRUE)`"
+---
+
+
+
+```{css, echo = FALSE}
+  #content{
+        max-width:2200px;
+    }
+ 
+```
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE)
+library(tidyverse)
+library(glmnet)
+library(here)
+```
+
+
+# Data Cleaning
+
+We used data from the questions `questions.csv` and `clients.csv` for this analysis.
+
+```{r data cleaning}
+
+
+# source(here('data_cleaning', 'data_cleaning.R'))
+
+questions <- read_csv(here('data', 'questions.csv'))
+
+questions <- questions %>%
+  mutate(closed_status = case_when(
+    TakenByAttorneyUno != "NULL" & ClosedByAttorneyUno != "NULL"  ~ "Taken and Closed",
+    TakenByAttorneyUno == "NULL" ~ "Never Taken",
+    TakenByAttorneyUno != "NULL" & 
+      ClosedByAttorneyUno == "NULL" ~ 
+      "Taken but Not Closed",
+    ClosedByAttorneyUno != "NULL" & 
+      TakenByAttorneyUno == "NULL" ~ "Closed but Not Taken"
+  ),
+  success = case_when(closed_status == "Taken and Closed" ~ "Success",
+                      closed_status == "Never Taken" ~ "Unsuccessful",
+                      closed_status %in% c( "Taken but Not Closed",
+                                            "Closed but Not Taken" ) ~ "Unsure")) %>% 
+  mutate(across(c(AskedOnUtc,
+                  TakenOnUtc, 
+                  ClosedOnUtc, 
+                  LegalDeadline),
+                ~strptime(.,
+                          format = "%Y-%m-%d %H:%M:%S", 
+                          tz = "GMT") %>%
+                  as.POSIXct()))%>%
+  mutate(
+    asked_on_to_taken_on =
+      difftime(TakenOnUtc,AskedOnUtc,
+               units = "days"),
+    taken_on_to_closed =
+      difftime(ClosedOnUtc,TakenOnUtc,
+               units = "days")) %>%
+  mutate(across(c(asked_on_to_taken_on,taken_on_to_closed),
+                as.numeric)) 
+
+#######################################################################################
+# THIS SECTION OF CODE IS FROM JOE BRIEN's POST ON STACK OVERFLOW 
+# https://stackoverflow.com/questions/9500114/find-which-season-a-particular-date-belongs-to
+#######################################################################################
+get_season <- function(dates) {
+    ws <- as.Date("2020-12-15", format = "%Y-%m-%d") 
+    se <- as.Date("2020-3-15",  format = "%Y-%m-%d")
+    ss <- as.Date("2020-6-15",  format = "%Y-%m-%d") 
+    fe <- as.Date("2020-9-15",  format = "%Y-%m-%d") 
+
+    # Convert dates from any year to 2012 dates
+    d <- as.Date(strftime(dates, format="2020-%m-%d"))
+
+    ifelse (d >= ws | d < se, "Winter",
+      ifelse (d >= se & d < ss, "Spring",
+        ifelse (d >= ss & d < fe, "Summer", "Fall")))
+}
+
+
+questions <- questions %>%
+  mutate(season_asked = get_season(AskedOnUtc)) 
+
+
+# bar plot of Proportion Successful by Season Question was Asked
+questions %>%
+  group_by(season_asked, success) %>%
+  summarize(n=n()) %>%
+  group_by(season_asked) %>%
+  mutate(tot = sum(n)) %>%
+  filter(success=="Success") %>%
+  mutate(prop = n/tot) %>%
+  ggplot(aes(x=season_asked,y=prop)) +
+  geom_bar(stat="identity") +
+  theme_bw() +
+  labs(title = "Proportion Successful by Season Question was Asked",
+       x= "Season",
+       y= "Proportion") +
+  theme(plot.title = element_text(face="bold", hjust =.5))
+
+
+
+
+
+clients <- read_csv(here("data", "clients.csv")) %>%
+  select(ClientUno, 
+         AnnualIncome,MaritalStatus,
+         Gender,Age,EthnicIdentity,
+         Imprisoned,
+         CheckingBalance,
+         SavingsBalance,
+         InvestmentsBalance) %>%
+  mutate(across(c(AnnualIncome, Age), 
+                as.numeric))
+
+questions_clients <- questions %>% 
+  left_join(clients, by = c('AskedByClientUno' = 'ClientUno')) %>%
+  mutate(EthnicIdentity = ifelse(EthnicIdentity == "NULL",
+                                 NA, EthnicIdentity)) 
+
+
+
+questions_clients <- questions_clients %>%
+  filter(AnnualIncome >= 0 & 
+           AnnualIncome <= quantile(AnnualIncome,.99,na.rm=TRUE)) %>%
+  filter(Age <= 122) %>%
+  filter(success != "Unsure")
+
+n_ambiguous <- questions_clients %>% 
+  filter(closed_status != "Success" & closed_status != "Unsuccessful") %>%
+  nrow()
+
+
+print(paste0("Proportion of Observations: ", n_ambiguous/nrow(questions_clients) )) 
+
+
+
+# pick most frequent gender as reference category
+questions_clients %>% 
+  group_by(Gender) %>% 
+  summarize(n=n()) %>% 
+  arrange(desc(n))
+
+
+questions_clients <- questions_clients %>%
+  mutate(across(where(is.character), ~ifelse(. == "NULL", NA, .))) %>%
+  mutate(across(c(SavingsBalance, CheckingBalance), as.numeric)) %>%
+  select(AnnualIncome, MaritalStatus, 
+         Age, Gender, Imprisoned,
+         Category, 
+         StateAbbr, 
+         success, 
+         season_asked,
+         AskedByClientUno,
+         EthnicIdentity) %>%
+  mutate(EthnicIdentity = gsub(
+    ", Not Hispanic or Latino|Not Hispanic or Latino", '', 
+    EthnicIdentity)) %>%
+  mutate(EthnicIdentity = case_when(
+    EthnicIdentity == "NULL" | EthnicIdentity == "" ~ NA,
+    grepl(",", EthnicIdentity) ~ "Multiple Ethnicities Checked",
+    TRUE ~ EthnicIdentity
+  )) %>%
+  mutate(
+         Gender = case_when(
+           Gender == "Female" ~ "Female",
+            Gender == "Male" ~ "Male",
+          grepl("Non-Conforming", Gender,fixed=TRUE) ~ "Non-Conforming",
+          TRUE ~ "Other"),
+         success= case_when(
+           success == "Unsuccessful" ~ 0, 
+           success=="Success" ~ 1)) %>%
+  mutate(across(c(MaritalStatus,
+                  Gender,
+                  Imprisoned,
+                  success,
+                  Category,
+                  StateAbbr, EthnicIdentity, season_asked), as.factor)) %>%
+  mutate(MaritalStatus = relevel(MaritalStatus,
+                                 ref = "Single"),
+         Gender = relevel(Gender, 
+                          ref = "Female"),
+         Imprisoned = relevel(Imprisoned,
+                              ref= "No"),
+         EthnicIdentity = relevel(EthnicIdentity, 
+                                  ref="Caucasian"),
+         Category = relevel(Category,
+                            ref = "Family and Children"),
+          StateAbbr = relevel(StateAbbr, 
+                              ref = "TX"),
+          Category = relevel(Category, ref= "Family and Children"),
+         season_asked = relevel(season_asked, 
+                                ref = "Summer")) %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  filter(if_all(.cols = everything(),  ~ !is.na(.x)))
+
+
+
+
+num_more_than_one <- questions_clients %>% 
+  group_by(AskedByClientUno) %>%
+  mutate(n=n()) %>% 
+  filter(n>1) %>%
+  nrow()
+
+
+
+prop <- num_more_than_one / nrow(questions_clients)
+
+cat(paste("Number of Observations Corresponding to Client ID that Asked More than 1: ", prop))
+
+num_more_than_2 <- questions_clients %>% 
+  group_by(AskedByClientUno) %>% 
+  summarize(n=n()) %>% 
+  filter(n>2) %>% 
+  nrow()
+
+prop_2 <- num_more_than_2 / nrow(questions_clients)
+
+cat(paste("Number of Observations Corresponding to Client ID that Asked More than 2: ", prop_2))
+
+train <- questions_clients %>%
+  select(-c(AskedByClientUno)) 
+
+
+# questions_clients$MaritalStatus %>% unique()
+
+```
+
+
+# Formulation of the Model
+
+We fit a logistic regression model with:
+
+* Annual Income (standardized)
+* Marital Status 
+* Age (standardized)
+* Gender
+* Imprisoned
+* Category
+* State Abbreviation
+* Ethnic Identity 
+* Season Question was Asked
+
+Choice of standardization following the approach of @gelman2008.
+
+
+```{r run logistic regression}
+
+# standardize continuous predictors
+train <- train %>% 
+  mutate(AnnualIncome_std = (AnnualIncome - mean(AnnualIncome))/ (2*sd(AnnualIncome)),
+         Age_std = (Age -  mean(Age)/ (2*sd(Age)))
+         ) 
+
+# mod <- glm( success ~ AnnualIncome + MaritalStatus + 
+#        Age + Gender + Imprisoned  +
+#        Category + StateAbbr, data = train, family = "binomial")
+
+mod <- glm( success ~ AnnualIncome_std + MaritalStatus + 
+       Age_std + Gender + Imprisoned  +
+       Category + StateAbbr + EthnicIdentity + season_asked,
+       data = train, family = "binomial")
+
+
+train %>% 
+  group_by(Category, success) %>%
+  summarize(n=n()) %>%
+  mutate(success=ifelse(success == 1, "Success", "Unsuccessful")) %>%
+  group_by(Category) %>%
+  mutate(tot =sum(n)) %>%
+  mutate(prop = n/tot) %>%
+  filter(success=="Success") %>%
+  ggplot(aes(x= fct_reorder(Category,prop), y = prop)) +
+  geom_bar(stat="identity", position ="dodge") +
+  coord_flip()
+
+train %>%
+  group_by(Category) %>%
+  summarize(n=n())
+
+
+
+
+train %>% 
+  mutate(predicted =predict.glm(mod, train, 
+                                type = "response")) %>%
+  mutate(closed_pred = ifelse(predicted > 0.5, 1, 0),
+         error = case_when(
+           success == 0 & closed_pred == 0 ~ "True negative",
+           success == 0 & closed_pred == 1 ~ "False Positive",
+          success == 1 & closed_pred == 1 ~ "True Positive",
+          success == 1 & closed_pred == 0 ~ "False Negative"
+         )) %>%
+  group_by(error) %>% 
+  summarize(n=n()) %>%
+  ungroup() %>%
+  mutate(tot = sum(n)) %>%
+  mutate(n=n/tot)
+
+
+```
+
+```{r}
+library(pROC)
+
+test_prob <- predict(mod, newdata = train, type = "response")
+test_roc <- roc(train$success ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+```
+
+```{r, error = TRUE, fig.width= 18, fig.height = 16}
+  
+# mod$coefficients %>%
+#   as_tibble(rownames = "Variable") %>%
+#   filter(Variable != "(Intercept)") 
+#  
+#   
+sig <- summary(mod)$coefficients %>% 
+  as_tibble(rownames="Variable") %>%
+   filter(`Pr(>|z|)` < 0.05 & Variable != "(Intercept)") %>%
+  pull(Variable)
+
+
+# conf <- confint(mod)
+# saveRDS(conf, here("data/confint.RDS"))
+
+
+# 
+# summary(mod)$coefficients %>%
+#   as_tibble(rownames= "Variable") %>%
+#   filter(Variable != "(Intercept)") 
+
+
+coefs <- mod$coefficients %>%
+  as_tibble(rownames = "Variable") %>%
+  mutate(value =exp(value)) %>%
+  select(coefficient = value, Variable)
+
+
+mod$coefficients %>%
+  as_tibble(rownames = "Variable") %>%
+  mutate(Variable = gsub("StateAbbr", "", Variable)) %>%
+  mutate(state = ifelse(nchar(Variable) != 2,
+                        "Coefficients",
+                        "State Coefficients")) %>%
+  filter(Variable != "(Intercept)")  %>%
+  ggplot(aes(y = fct_reorder(Variable, value),
+             x= value)) +
+  geom_point() +
+  theme_bw() +
+  facet_wrap(~state, scales="free") +
+  geom_vline(xintercept = 0,
+             linetype = 2, 
+             color="darkred",
+             alpha = .5) +
+  labs(y = "")
+
+
+
+# confidence intervals
+ci <- confint.default(mod, method = "wald") %>%
+    as_tibble(rownames = "Variable") %>%
+    left_join(coefs) %>%
+  mutate(across(c( `2.5 %`,`97.5 %`), exp)) 
+
+
+saveRDS(ci, here('results', "confint_model.RDS"))
+  
+  
+ci %>%
+    filter(Variable %in% sig) %>%
+    mutate(Variable = gsub("StateAbbr", "", Variable)) %>%
+    mutate(coefficient_type = case_when(
+      nchar(Variable) == 2 ~ "State Coefficients",
+     #  grepl("Gender", Variable) ~ "Gender",
+      grepl("Category", Variable) ~ "Question Category",
+      grepl("EthnicIdentity", Variable) ~ "Ethnic Identity",
+     grepl("season_asked", Variable) ~"Season",
+   #   grepl("Marital", Variable) ~ "Marital",
+      TRUE ~ "Other Demographic Characteristics")) %>%
+  mutate(Variable = gsub("Age_std", "Age (Standardized)",
+                         Variable),
+         Variable = gsub("MaritalStatus", 
+                         "Marital Status: ",
+                         Variable),
+         Variable = gsub("Gender|EthnicIdentity|season_asked", '', Variable),
+         Variable = gsub('AnnualIncome_std',
+                         'Annual Income (Standardized)',
+                         Variable),
+         Variable = gsub('Category',
+                         '', Variable)) %>%
+    filter(Variable != "(Intercept)") %>%
+  ggplot(aes(y = fct_reorder(Variable, `2.5 %`),
+             xmin = `2.5 %`,
+             xmax =`97.5 %`)) +
+  geom_point(color = "darkred", aes(x=coefficient)) +
+  geom_errorbar(width = .5) +
+  theme_bw() +
+  facet_wrap(~coefficient_type, 
+             scales="free", 
+             ncol =2) +
+  geom_vline(xintercept = 1,
+             linetype = 2, 
+             color="darkred",
+             alpha = .5) +
+  labs(y = "",
+       x = "Odds Ratio",
+       title = "Coefficient Estimates for Logistic Regression Model") +
+  theme(strip.background = element_rect(fill = "#323232"),
+        strip.text=element_text(color="white",
+                                face="bold",
+                                size = 14),
+        axis.text = element_text(size = 12),
+        plot.title = element_text(hjust = .5, face = "bold", size = 25))
+
+
+
+
+```
+
+```{r, results='asis', eval=FALSE}
+
+
+l <- ceiling(length(mod$coefficients)/2)
+end <- length(mod$coefficients) -1
+
+model_for1 <- paste0("\\beta_{", 0:l, "} (",
+                gsub("_", ".", names(mod$coefficients)[1:(l+1)], fixed = TRUE ),
+                ")",
+                collapse="+") %>%
+  gsub("((Intercept))", "",., fixed=TRUE)
+
+model_for2 <-  paste0("\\beta_{", (l+1):end, "} (",
+                gsub("_", ".", names(mod$coefficients)[(l+2):end], 
+                     fixed = TRUE ),
+                ")",
+                collapse="+") 
+
+cat("$$\\hat{\\text{log odds}(y=success)}=", 
+    model_for1, "+$$")
+cat("$$", model_for2, "$$")
+
+
+```
+
+
+# Model Diagnostics
+
+
+For model diagnostics, we calculate the randomized quantile residuals using the implementationof the [DHARMa R package](https://cran.r-project.org/web/packages/DHARMa/vignettes/DHARMa.html) [@florianhartig2022]. Randomized quantile residuals were introduced by @dunn1996a and offer advantages over other forms of residuals (e.g., deviance and Pearson) for diagnosing problems with generalized linear models.
+
+
+```{r, fig.show='hold', out.width='50%'}
+
+# train %>% group_by(Category) %>%
+#   summarize(n=n()) %>% 
+#   arrange(desc(n))
+
+library(DHARMa)
+
+
+# pearson residuals
+train %>%
+  mutate(res = residuals(mod, type = "pearson"),
+         odds = predict(mod, type = "link"),
+        ) %>%
+  ggplot(aes(sample=res)) +
+  stat_qq() +
+  stat_qq_line(color = "darkred") +
+  labs(title = "Pearson Residuals")+
+  theme_bw() +
+  theme(plot.title = element_text(hjust = .5, 
+                                  face = "bold",
+                                  size = 16))
+
+
+
+# randomized quantile residuals
+simulationOutput <- simulateResiduals(fittedModel = mod,
+                                      plot = FALSE, 
+                                      n = 250)
+
+tibble(residuals = residuals(simulationOutput)) %>%
+  ggplot(aes(sample = residuals)) +
+  stat_qq(distribution = stats::qunif, alpha = .01, size = 1) +
+  stat_qq_line(distribution = stats::qunif,
+               color = "darkred",
+               linewidth = 1.2) +
+  theme_bw() +
+  labs(title = "QQ Plot of Randomized Quantile Residuals") +
+  theme(plot.title = element_text(hjust = .5, 
+                                  face = "bold",
+                                  size = 16))
+
+
+
+```
+
+
+# Frequency of Different Variables in the Data
+
+
+```{r, fig.show='hold', out.width='50%'}
+
+library(scales)
+
+
+
+questions_clients %>% 
+  group_by(EthnicIdentity) %>% 
+  summarize(n=n()) %>%
+  ggplot(aes(x= fct_reorder(EthnicIdentity,n),
+             y=n)) +
+  geom_bar(stat="identity") +
+  theme_bw() +
+  labs(x = "Number of Observations",
+       y = "Ethnic Identity",
+       title = "Number of Observations by Ethic Identity") +
+  coord_flip() +
+  scale_y_continuous(labels=comma) +
+  theme(plot.title = element_text(hjust = .5, 
+                                  face = "bold",
+                                  size = 16))
+  
+  
+questions_clients %>% 
+  group_by(season_asked) %>% 
+  summarize(n=n()) %>%
+  ggplot(aes(x= fct_reorder(season_asked,n),
+             y=n)) +
+  geom_bar(stat="identity") +
+  theme_bw() +
+  labs(x = "Number of Observations",
+       y = "Season Asked",
+       title = "Number of Observations by Season Asked") +
+  coord_flip() +
+  scale_y_continuous(label=comma)+
+  theme(plot.title = element_text(hjust = .5, 
+                                  face = "bold",
+                                  size = 16))
+  
+
+
+questions_clients %>% 
+  group_by(Category) %>% 
+  summarize(n=n()) %>%
+  ggplot(aes(x= fct_reorder(Category,n),
+             y=n)) +
+  geom_bar(stat="identity") +
+  theme_bw() +
+  labs(x = "Number of Observations",
+       y = "Question Category",
+       title = "Number of Observations by Question Category") +
+  coord_flip() +
+  scale_y_continuous(label=comma)+
+  theme(plot.title = element_text(hjust = .5, 
+                                  face = "bold",
+                                  size = 16))
+
+
+```
+
+# References
+
